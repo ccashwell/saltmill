@@ -1,0 +1,29 @@
+[package]
+name = "saltmill"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Vanity salt miner for CREATE2 and CREATE3 (CreateX) addresses on CPU, GPU and hybrid Apple silicon"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+console = "0.15"
+getrandom = "0.2"
+keccak-asm = "0.1"
+ocl = { version = "0.19", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+objc = "0.2"
+
+[features]
+# OpenCL GPU backend for non-Apple GPUs (needs an OpenCL ICD loader at link time)
+opencl = ["dep:ocl"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+strip = true
+panic = "abort"
+codegen-units = 1
