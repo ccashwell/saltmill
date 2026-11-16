@@ -5,3 +5,4 @@
 pub mod keccak;
 pub mod pattern;
 pub mod plan;
+pub mod session;
