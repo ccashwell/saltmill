@@ -145,21 +145,23 @@ impl Plan {
         salt[..self.free_start] == self.salt_base[..self.free_start]
     }
 
-    /// The guard preimage for `salt` and the salt's offset in it.
-    fn guard_message(&self, salt: &[u8; 32]) -> Option<(Vec<u8>, usize)> {
+    /// The guard preimage for `salt`, as a buffer and its length. The salt is
+    /// always the preimage's last 32 bytes. Allocation-free: the scalar miner
+    /// builds one per candidate.
+    fn guard_message(&self, salt: &[u8; 32]) -> Option<([u8; 96], usize)> {
         let Guard::CreateX { chain_id } = self.guard else {
             return None;
         };
-        // keccak256(abi.encode(caller, salt)) or abi.encode(caller, chainId, salt)
-        let mut message = vec![0u8; 12];
-        message.extend_from_slice(&self.caller);
+        // abi.encode(caller, salt), or abi.encode(caller, chainId, salt)
+        let mut message = [0u8; 96];
+        message[12..32].copy_from_slice(&self.caller);
+        let mut len = 32;
         if let Some(chain_id) = chain_id {
-            message.extend_from_slice(&[0u8; 24]);
-            message.extend_from_slice(&chain_id.to_be_bytes());
+            message[56..64].copy_from_slice(&chain_id.to_be_bytes());
+            len = 64;
         }
-        let offset = message.len();
-        message.extend_from_slice(salt);
-        Some((message, offset))
+        message[len..len + 32].copy_from_slice(salt);
+        Some((message, len + 32))
     }
 
     fn create2_message(&self, salt: &[u8; 32]) -> [u8; 85] {
@@ -174,7 +176,7 @@ impl Plan {
     /// The salt CREATE2 receives: `salt` itself, or its guard hash.
     pub fn guarded_salt(&self, salt: &[u8; 32]) -> [u8; 32] {
         match self.guard_message(salt) {
-            Some((message, _)) => keccak256(&message),
+            Some((message, len)) => keccak256(&message[..len]),
             None => *salt,
         }
     }
@@ -205,9 +207,9 @@ impl Plan {
     pub fn lane_job(&self, tag: &[u8]) -> LaneJob {
         let salt = self.salt(tag, 0);
         let (first, salt_offset, guarded_create2) = match self.guard_message(&salt) {
-            Some((message, offset)) => (
-                block_lanes(&message),
-                offset,
+            Some((message, len)) => (
+                block_lanes(&message[..len]),
+                len - 32,
                 Some(block_lanes(&self.create2_message(&[0u8; 32]))),
             ),
             None => (block_lanes(&self.create2_message(&salt)), 21, None),
