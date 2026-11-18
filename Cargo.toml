@@ -2,7 +2,7 @@
 name = "saltmill"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.79"
 license = "MIT"
 description = "Vanity salt miner for CREATE2 and CREATE3 (CreateX) addresses on CPU, GPU and hybrid Apple silicon"
 

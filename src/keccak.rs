@@ -2,7 +2,7 @@
 //! sponge-lane view of a single-block message, and the bit-interleaved lane
 //! representation the GPU kernel works in.
 
-use keccak_asm::{Digest, Keccak256};
+use keccak_asm::Keccak256;
 
 /// Keccak-256 rate in bytes. Every message the miner hashes fits in one block.
 pub const RATE: usize = 136;
