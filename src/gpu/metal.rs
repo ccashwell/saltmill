@@ -3,12 +3,15 @@
 //! macOS's OpenCL implementation is deprecated and runs as a shim over
 //! Metal; driving the same kernel through Metal directly is roughly ten
 //! times faster on Apple silicon. Buffers use the unified-memory shared
-//! storage mode, so the nonce is written and the solutions are read back
+//! storage mode, so the inputs are written and the solutions are read back
 //! without any copies, and each dispatch simply blocks on completion.
 
-use super::{Device, Flavor, Found, Program, MAX_SOLUTIONS};
+use super::{Device, Flavor, Found, Program, Target, MAX_SOLUTIONS};
 use metal::{MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
 use objc::rc::autoreleasepool;
+
+/// The kernel's input buffer: the nonce and the eleven target words.
+const INPUT_WORDS: usize = 12;
 
 pub(super) struct MetalDevice {
     device: metal::Device,
@@ -58,7 +61,7 @@ impl Device for MetalDevice {
         let shared = MTLResourceOptions::StorageModeShared;
         Ok(Box::new(MetalProgram {
             queue: self.device.new_command_queue(),
-            nonce: self.device.new_buffer(4, shared),
+            input: self.device.new_buffer(4 * INPUT_WORDS as u64, shared),
             count: self.device.new_buffer(4, shared),
             slots: self.device.new_buffer(4 * MAX_SOLUTIONS as u64, shared),
             group: pipeline.max_total_threads_per_threadgroup().min(256),
@@ -70,18 +73,28 @@ impl Device for MetalDevice {
 struct MetalProgram {
     queue: metal::CommandQueue,
     pipeline: metal::ComputePipelineState,
-    nonce: metal::Buffer,
+    /// the dispatch nonce, then the target words
+    input: metal::Buffer,
     count: metal::Buffer,
     slots: metal::Buffer,
     group: u64,
 }
 
 impl Program for MetalProgram {
-    fn dispatch(&mut self, nonce: u32, size: u32) -> Result<Found, String> {
-        // SAFETY: both buffers are 4 bytes of shared storage owned by self,
-        // and no command buffer is in flight between dispatches
+    fn set_target(&mut self, target: &Target) -> Result<(), String> {
+        // SAFETY: input holds INPUT_WORDS u32s of shared storage owned by
+        // self, and no command buffer is in flight between dispatches
         unsafe {
-            *(self.nonce.contents() as *mut u32) = nonce;
+            let words = self.input.contents() as *mut u32;
+            std::ptr::copy_nonoverlapping(target.as_ptr(), words.add(1), target.len());
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self, nonce: u32, size: u32) -> Result<Found, String> {
+        // SAFETY: as in set_target; count is 4 bytes of shared storage
+        unsafe {
+            *(self.input.contents() as *mut u32) = nonce;
             *(self.count.contents() as *mut u32) = 0;
         }
 
@@ -90,7 +103,7 @@ impl Program for MetalProgram {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline);
-            encoder.set_buffer(0, Some(&self.nonce), 0);
+            encoder.set_buffer(0, Some(&self.input), 0);
             encoder.set_buffer(1, Some(&self.count), 0);
             encoder.set_buffer(2, Some(&self.slots), 0);
             encoder.dispatch_threads(

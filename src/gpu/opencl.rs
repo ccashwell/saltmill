@@ -4,7 +4,7 @@
 //! OpenCL is a deprecated shim over Metal and about ten times slower than
 //! the native backend, so there it is only useful for checking the kernel.
 
-use super::{Device, Flavor, Found, Program, MAX_SOLUTIONS};
+use super::{Device, Flavor, Found, Program, Target, MAX_SOLUTIONS};
 use ocl::{Buffer, Context, Kernel, MemFlags, Platform, Queue};
 
 pub(super) struct OpenClDevice {
@@ -59,21 +59,22 @@ impl Device for OpenClDevice {
                     .len(len)
                     .build()
             };
-            let nonce = buffer(1, MemFlags::new().read_only())?;
+            let input = buffer(12, MemFlags::new().read_only())?;
             let count = buffer(1, MemFlags::new().read_write())?;
             let slots = buffer(MAX_SOLUTIONS, MemFlags::new().write_only())?;
             let kernel = Kernel::builder()
                 .program(&program)
                 .name("mine")
                 .queue(self.queue.clone())
-                .arg(&nonce)
+                .arg(&input)
                 .arg(&count)
                 .arg(&slots)
                 .build()?;
             Ok(OpenClProgram {
                 queue: self.queue.clone(),
                 kernel,
-                nonce,
+                input,
+                words: [0; 12],
                 count,
                 slots,
             })
@@ -87,15 +88,23 @@ impl Device for OpenClDevice {
 struct OpenClProgram {
     queue: Queue,
     kernel: Kernel,
-    nonce: Buffer<u32>,
+    input: Buffer<u32>,
+    /// host copy of the input buffer: the dispatch nonce, then the target
+    words: [u32; 12],
     count: Buffer<u32>,
     slots: Buffer<u32>,
 }
 
 impl Program for OpenClProgram {
+    fn set_target(&mut self, target: &Target) -> Result<(), String> {
+        self.words[1..].copy_from_slice(target);
+        Ok(())
+    }
+
     fn dispatch(&mut self, nonce: u32, size: u32) -> Result<Found, String> {
+        self.words[0] = nonce;
         let dispatch = || -> ocl::Result<Found> {
-            self.nonce.write(&[nonce][..]).enq()?;
+            self.input.write(&self.words[..]).enq()?;
             self.count.write(&[0u32][..]).enq()?;
             // SAFETY: the kernel only writes the count and slots buffers,
             // within their bounds (slot indices are checked against

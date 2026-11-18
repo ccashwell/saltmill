@@ -20,8 +20,15 @@
 *   create2               address = keccak256(0xff ++ factory ++ salt ++ hash)[12..]
 *   create  (HAS_CREATE)  address = keccak256(0xd6 0x94 ++ address ++ 0x01)[12..]
 *
+* The target is a runtime input rather than a compiled-in constant: eleven
+* words holding a mask and a value for each of the five little-endian
+* address words, then the minimum number of zero address bytes. Testing it
+* costs a fraction of a percent of a candidate, and it lets the host check
+* the very kernel it is about to mine with against a known answer.
+*
 * This file is pure C, compiled as either OpenCL C or Metal Shading
-* Language; the per-API wrapper defines the entry point.
+* Language; the per-API wrapper defines the address-space macro
+* SPACE_CONSTANT and the entry point.
 *
 * The host defines, all bit-interleaved (_E even bits, _O odd bits):
 *   M{i}_E/_O, i in 0..17   rate lanes of the first message, counter bytes zero
@@ -32,8 +39,6 @@
 *   HAS_CREATE              0/1; when 1 also C0, C2, C16: the constant parts
 *                           of the CREATE message lanes
 *   RC{i}_E/_O, i in 0..24  iota round constants
-*   hasPattern(w)           the address test over five little-endian words
-*   TOTAL_ZEROES            optional minimum number of zero address bytes
 */
 
 #define rotl32(x, s) rotate((uint)(x), (uint)(s))
@@ -225,7 +230,7 @@ ae[24] = 0; ao[24] = 0;
   (uint)(((w) & 0x00ff0000u) == 0u) + (uint)(((w) & 0xff000000u) == 0u))
 
 // derive one candidate's address and report whether it meets the target
-static inline bool hashAndCheck(uint gid, uint dn)
+static inline bool hashAndCheck(uint gid, uint dn, SPACE_CONSTANT uint const *target)
 {
   uint ae[25];
   uint ao[25];
@@ -350,10 +355,11 @@ static inline bool hashAndCheck(uint gid, uint dn)
   w[3] = shuffle((l3e & 0xffffu) | ((l3o & 0xffffu) << 16));
   w[4] = shuffle((l3e >> 16) | (l3o & 0xffff0000u));
 
-  return hasPattern(w)
-#ifdef TOTAL_ZEROES
+  return ((w[0] & target[0]) == target[5])
+    && ((w[1] & target[1]) == target[6])
+    && ((w[2] & target[2]) == target[7])
+    && ((w[3] & target[3]) == target[8])
+    && ((w[4] & target[4]) == target[9])
     && (zeroBytes(w[0]) + zeroBytes(w[1]) + zeroBytes(w[2]) + zeroBytes(w[3]) + zeroBytes(w[4])
-        >= TOTAL_ZEROES)
-#endif
-  ;
+        >= target[10]);
 }

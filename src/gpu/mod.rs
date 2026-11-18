@@ -3,10 +3,10 @@
 //! batches of 2^N candidates.
 //!
 //! The kernel is specialized at build time: every constant byte of every
-//! message, the position of the counter and the target itself are compiled
-//! in, so the only per-dispatch input is a 32-bit nonce. A candidate's
-//! counter is `gid | nonce << 32`, where `gid` is the thread's position in
-//! the batch.
+//! message and the position of the counter are compiled in. The target and
+//! a 32-bit nonce are runtime inputs, so the kernel that passes the
+//! self-test is the one that mines. A candidate's counter is
+//! `gid | nonce << 32`, where `gid` is the thread's position in the batch.
 
 use crate::keccak::{bit_interleave, block_lanes, RC};
 use crate::pattern::{Criteria, Pattern};
@@ -54,8 +54,14 @@ pub trait Device {
     fn compile(&self, source: &str) -> Result<Box<dyn Program>, String>;
 }
 
+/// The kernel's runtime target: a mask and a value for each of the five
+/// little-endian address words, then the minimum number of zero bytes.
+pub type Target = [u32; 11];
+
 /// A compiled kernel with its buffers.
 pub trait Program {
+    /// Set what the following dispatches look for.
+    fn set_target(&mut self, target: &Target) -> Result<(), String>;
     /// Run `size` candidates under `nonce` and wait for the result.
     fn dispatch(&mut self, nonce: u32, size: u32) -> Result<Found, String>;
 }
@@ -145,41 +151,51 @@ pub fn run(session: &Session, config: &GpuConfig, ready: Sender<Result<String, S
 
 fn prepare(session: &Session, config: &GpuConfig) -> Result<(String, Box<dyn Program>), String> {
     let device = open(config.backend, config.device)?;
-    self_test(device.as_ref(), &session.plan, &config.tag)?;
     let job = session.plan.lane_job(&config.tag);
-    let source = kernel_source(&job, &session.criteria, device.flavor());
-    let program = device.compile(&source)?;
+    let mut program = device.compile(&kernel_source(&job, device.flavor()))?;
+    self_test(program.as_mut(), &session.plan, &config.tag)
+        .map_err(|e| format!("{e} ({})", device.describe()))?;
+    program.set_target(&target_words(&session.criteria))?;
     Ok((device.describe(), program))
 }
 
-/// Build the kernel for this plan with one known candidate's address as the
-/// target and check that the device finds exactly that candidate. A kernel
-/// that derived addresses wrongly would otherwise mine forever in silence.
-pub fn self_test(device: &dyn Device, plan: &Plan, tag: &[u8]) -> Result<(), String> {
+/// Aim the kernel at one known candidate's address and check that the
+/// device finds exactly that candidate. A kernel that derived addresses
+/// wrongly would otherwise mine forever in silence. Leaves the program's
+/// target set to the test address.
+pub fn self_test(program: &mut dyn Program, plan: &Plan, tag: &[u8]) -> Result<(), String> {
     const GRID: u32 = 4096;
     const GID: u32 = 0x0abc;
     const NONCE: u32 = 0xa5c3_0f69;
 
     let counter = GID as u64 | (NONCE as u64) << 32;
     let expected = plan.address(&plan.salt(tag, counter));
-    let criteria = Criteria {
+    program.set_target(&target_words(&Criteria {
         pattern: Pattern::exact(&expected),
         total_zero_bytes: None,
-    };
-    let source = kernel_source(&plan.lane_job(tag), &criteria, device.flavor());
-    let found = device.compile(&source)?.dispatch(NONCE, GRID)?;
+    }))?;
+    let found = program.dispatch(NONCE, GRID)?;
     if found.gids != [GID] {
         return Err(format!(
-            "GPU kernel self-test failed on {}: expected candidate {GID:#x} to match, got {:?}",
-            device.describe(),
+            "GPU kernel self-test failed: expected candidate {GID:#x} to match, got {:?}",
             found.gids
         ));
     }
     Ok(())
 }
 
-/// Generate the kernel source (MSL or OpenCL C) for a job and target.
-pub fn kernel_source(job: &LaneJob, criteria: &Criteria, flavor: Flavor) -> String {
+/// The criteria in the form the kernel tests.
+pub fn target_words(criteria: &Criteria) -> Target {
+    let (mask, value) = criteria.pattern.words();
+    let mut target = [0u32; 11];
+    target[..5].copy_from_slice(&mask);
+    target[5..10].copy_from_slice(&value);
+    target[10] = criteria.total_zero_bytes.unwrap_or(0) as u32;
+    target
+}
+
+/// Generate the kernel source (MSL or OpenCL C) for a job.
+pub fn kernel_source(job: &LaneJob, flavor: Flavor) -> String {
     let mut src = String::with_capacity(8192 + KERNEL_CORE.len());
 
     let define_lane = |src: &mut String, name: &str, lane: u64| {
@@ -222,28 +238,6 @@ pub fn kernel_source(job: &LaneJob, criteria: &Criteria, flavor: Flavor) -> Stri
 
     for (i, &rc) in RC.iter().enumerate() {
         define_lane(&mut src, &format!("RC{i}"), rc);
-    }
-
-    // one comparison per address word the pattern constrains
-    let (mask, value) = criteria.pattern.words();
-    let conditions: Vec<String> = (0..5)
-        .filter(|&i| mask[i] != 0)
-        .map(|i| {
-            if mask[i] == u32::MAX {
-                format!("((w)[{i}] == {}u)", value[i])
-            } else {
-                format!("(((w)[{i}] & {}u) == {}u)", mask[i], value[i])
-            }
-        })
-        .collect();
-    let conditions = if conditions.is_empty() {
-        "(1)".to_string()
-    } else {
-        conditions.join(" && ")
-    };
-    writeln!(src, "#define hasPattern(w) ({conditions})").unwrap();
-    if let Some(min) = criteria.total_zero_bytes {
-        writeln!(src, "#define TOTAL_ZEROES {min}u").unwrap();
     }
     writeln!(src, "#define MAX_SOLUTIONS {MAX_SOLUTIONS}u").unwrap();
 
@@ -341,33 +335,23 @@ mod tests {
     }
 
     #[test]
-    fn kernel_source_embeds_job_and_target() {
+    fn kernel_source_embeds_the_job() {
         let plans = all_plans();
-        let criteria = Criteria {
-            pattern: Pattern::from_hook_flags(0x2400),
-            total_zero_bytes: None,
-        };
 
         // raw CREATE2: one stage, counter straddling lanes 5 and 6
         let job = plans[0].lane_job(&[0; 4]);
-        let src = kernel_source(&job, &criteria, Flavor::Metal);
+        let src = kernel_source(&job, Flavor::Metal);
         let (e, o) = bit_interleave(job.first[0]);
         assert!(src.contains(&format!("#define M0_E {e}u\n#define M0_O {o}u\n")));
         assert!(src.contains("#define CTR_LANE 5\n#define CTR_SHIFT 40\n"));
         assert!(src.contains("#define HAS_GUARD 0\n"));
         assert!(src.contains("#define HAS_CREATE 0\n"));
         assert!(!src.contains("#define P0_E") && !src.contains("#define C0_E"));
-        assert!(src.contains("#define hasPattern(w) ((((w)[4] & 4282318848u) == 2359296u))\n"));
-        assert!(!src.contains("#define TOTAL_ZEROES"));
         assert!(src.contains("kernel void mine(") && src.contains("metal_stdlib"));
 
         // CreateX CREATE3: all three stages
         let job = plans[5].lane_job(&[0; 3]);
-        let criteria = Criteria {
-            pattern: Pattern::default(),
-            total_zero_bytes: Some(6),
-        };
-        let src = kernel_source(&job, &criteria, Flavor::OpenCl);
+        let src = kernel_source(&job, Flavor::OpenCl);
         assert!(src.contains("#define CTR_LANE 7\n#define CTR_SHIFT 0\n"));
         assert!(src.contains("#define HAS_GUARD 1\n"));
         assert!(src.contains("#define HAS_CREATE 1\n"));
@@ -377,27 +361,40 @@ mod tests {
         assert!(src.contains(&format!("#define C2_E {e}u\n#define C2_O {o}u\n")));
         let (e, o) = bit_interleave(RC[23]);
         assert!(src.contains(&format!("#define RC23_E {e}u\n#define RC23_O {o}u\n")));
-        assert!(src.contains("#define hasPattern(w) ((1))\n"));
-        assert!(src.contains("#define TOTAL_ZEROES 6u\n"));
         assert!(src.contains("__kernel void mine(") && !src.contains("metal_stdlib"));
+    }
+
+    #[test]
+    fn target_words_are_masks_values_then_zero_bytes() {
+        let target = target_words(&Criteria {
+            pattern: Pattern::from_hook_flags(0x2400),
+            total_zero_bytes: Some(6),
+        });
+        assert_eq!(target[..4], [0; 4]);
+        assert_eq!(target[4], 0xff3f_0000);
+        assert_eq!(target[5..9], [0; 4]);
+        assert_eq!(target[9], 0x0024_0000);
+        assert_eq!(target[10], 6);
+        assert_eq!(target_words(&Criteria::default()), [0; 11]);
     }
 
     /// Every candidate of a batch, checked on the host: the device must
     /// report exactly the candidates the reference derivation accepts.
-    fn check_batch(device: &dyn Device, plan: &Plan, criteria: &Criteria, size: u32) {
+    fn check_batch(
+        program: &mut dyn Program,
+        plan: &Plan,
+        tag: &[u8],
+        criteria: &Criteria,
+        size: u32,
+    ) {
         const NONCE: u32 = 0x8001_0203;
-        let tag: Vec<u8> = (0..plan.tag_len() as u8).map(|i| 0xe1 + i).collect();
-        let source = kernel_source(&plan.lane_job(&tag), criteria, device.flavor());
-        let found = device
-            .compile(&source)
-            .unwrap()
-            .dispatch(NONCE, size)
-            .unwrap();
+        program.set_target(&target_words(criteria)).unwrap();
+        let found = program.dispatch(NONCE, size).unwrap();
 
         let expected: Vec<u32> = (0..size)
             .filter(|&gid| {
                 let counter = gid as u64 | (NONCE as u64) << 32;
-                criteria.matches(&plan.address(&plan.salt(&tag, counter)))
+                criteria.matches(&plan.address(&plan.salt(tag, counter)))
             })
             .collect();
         assert!(
@@ -421,9 +418,12 @@ mod tests {
             total_zero_bytes: Some(1),
         };
         for plan in all_plans() {
-            self_test(device, &plan, &vec![0x3c; plan.tag_len()]).unwrap();
-            check_batch(device, &plan, &prefix, 1 << 16);
-            check_batch(device, &plan, &suffix_and_zeros, 1 << 12);
+            let tag: Vec<u8> = (0..plan.tag_len() as u8).map(|i| 0xe1 + i).collect();
+            let source = kernel_source(&plan.lane_job(&tag), device.flavor());
+            let mut program = device.compile(&source).unwrap();
+            self_test(program.as_mut(), &plan, &tag).unwrap();
+            check_batch(program.as_mut(), &plan, &tag, &prefix, 1 << 16);
+            check_batch(program.as_mut(), &plan, &tag, &suffix_and_zeros, 1 << 12);
         }
     }
 
@@ -458,17 +458,31 @@ mod tests {
             total_zero_bytes: None,
         };
         let tag = vec![0u8; plan.tag_len()];
-        let source = kernel_source(&plan.lane_job(&tag), &criteria, device.flavor());
-        let found = device
-            .compile(&source)
-            .unwrap()
-            .dispatch(7, 1 << 14)
-            .unwrap();
+        let source = kernel_source(&plan.lane_job(&tag), device.flavor());
+        let mut program = device.compile(&source).unwrap();
+        program.set_target(&target_words(&criteria)).unwrap();
+        let found = program.dispatch(7, 1 << 14).unwrap();
         assert_eq!(found.gids.len(), MAX_SOLUTIONS);
         assert!(found.count > 800 && found.count < 1250, "{}", found.count);
         for gid in found.gids {
             let counter = gid as u64 | 7 << 32;
             assert!(criteria.matches(&plan.address(&plan.salt(&tag, counter))));
         }
+    }
+
+    /// A self-test must fail when the kernel derives something else: here
+    /// it is compiled for one tag and tested against another.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn self_test_rejects_a_kernel_for_another_derivation() {
+        let Ok(device) = open(Backend::Metal, 0) else {
+            return;
+        };
+        let plan = all_plans().remove(5);
+        let source = kernel_source(&plan.lane_job(&[1, 2, 3]), device.flavor());
+        let mut program = device.compile(&source).unwrap();
+        assert!(self_test(program.as_mut(), &plan, &[1, 2, 3]).is_ok());
+        let error = self_test(program.as_mut(), &plan, &[1, 2, 4]).unwrap_err();
+        assert!(error.contains("self-test failed"), "{error}");
     }
 }

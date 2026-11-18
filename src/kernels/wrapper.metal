@@ -3,18 +3,21 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#define SPACE_CONSTANT constant
+
 //__CORE__//
 
 // One thread per candidate. A hit claims the next slot of the solutions
 // buffer through an atomic counter, so several hits in one dispatch are all
 // reported (up to MAX_SOLUTIONS; the count keeps running past it).
+// d_input is the dispatch nonce followed by the eleven target words.
 kernel void mine(
-  constant uint *d_nonce [[buffer(0)]],
+  constant uint *d_input [[buffer(0)]],
   device atomic_uint *d_count [[buffer(1)]],
   device uint *d_slots [[buffer(2)]],
   uint gid [[thread_position_in_grid]]
 ) {
-  if (hashAndCheck(gid, d_nonce[0])) {
+  if (hashAndCheck(gid, d_input[0], d_input + 1)) {
     uint slot = atomic_fetch_add_explicit(d_count, 1u, memory_order_relaxed);
     if (slot < MAX_SOLUTIONS) {
       d_slots[slot] = gid;
