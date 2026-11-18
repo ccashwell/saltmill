@@ -91,6 +91,10 @@ pub struct Args {
     )]
     pub count: u64,
 
+    /// Give up after this many seconds
+    #[arg(long, value_name = "SECONDS", help_heading = "Run")]
+    pub time_limit: Option<u64>,
+
     /// Also append each hit to this file
     #[arg(short, long, value_name = "FILE", help_heading = "Run")]
     pub output: Option<PathBuf>,
@@ -200,6 +204,7 @@ pub struct Config {
     pub plan: Plan,
     pub criteria: Criteria,
     pub count: u64,
+    pub time_limit: Option<u64>,
     pub output: Option<PathBuf>,
     pub check: Option<[u8; 32]>,
     pub seed: Option<u32>,
@@ -319,6 +324,7 @@ impl Config {
             plan: Plan::new(args.scheme, guard, factory, caller, init_code_hash),
             criteria,
             count: args.count,
+            time_limit: args.time_limit,
             output: args.output,
             check: args.check,
             seed: args.seed,

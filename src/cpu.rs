@@ -65,15 +65,17 @@ pub const MAX_THREADS: usize = 256;
 /// counter, keeping both off the innermost loop.
 const CHUNK: u64 = 1 << 14;
 
-/// Start `threads` miners on the session, all searching under `tag`.
+/// Start one miner per index on the session, all searching under `tag`.
+/// A thread's index selects its stripe of the counter space, so indices
+/// must not repeat within a run.
 pub fn spawn(
     session: &Arc<Session>,
-    threads: usize,
+    indices: std::ops::Range<usize>,
     tag: Vec<u8>,
     kernel: Kernel,
 ) -> Vec<JoinHandle<()>> {
-    assert!((1..=MAX_THREADS).contains(&threads));
-    (0..threads)
+    assert!(indices.end <= MAX_THREADS);
+    indices
         .map(|index| {
             let session = session.clone();
             let tag = tag.clone();
@@ -156,7 +158,7 @@ mod tests {
                     None,
                     StatusMode::Quiet,
                 ));
-                for handle in spawn(&session, 2, tag.clone(), kernel) {
+                for handle in spawn(&session, 0..2, tag.clone(), kernel) {
                     handle.join().unwrap();
                 }
 

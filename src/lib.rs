@@ -23,7 +23,7 @@ use session::{Hit, Session, StatusMode};
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Run a configuration to completion and return its hits.
 pub fn run(config: Config) -> Result<Vec<Hit>, String> {
@@ -56,16 +56,43 @@ pub fn run(config: Config) -> Result<Vec<Hit>, String> {
         mode,
     ));
     let (cpu_tag, gpu_tag) = tags(&config.plan, config.seed)?;
+    let deadline = config
+        .time_limit
+        .map(|secs| Instant::now() + Duration::from_secs(secs));
     let mut miners = Vec::new();
 
-    // the GPU first: whether it comes up decides how many cores the CPU
-    // miner takes
     let try_gpu = match config.compute {
         Compute::Cpu => false,
         Compute::Gpu | Compute::Hybrid => true,
         Compute::Auto => config.backend != gpu::Backend::Auto || gpu::auto_backend_compiled(),
     };
-    let mut gpu_running = false;
+
+    // the CPU starts hashing at once; the GPU needs a second to compile
+    let cpu_kernel = match config.compute {
+        Compute::Gpu => None,
+        _ => Some(cpu::resolve_kernel(config.cpu_kernel)?),
+    };
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cpu_label = |threads: usize, kernel: cpu::Kernel| {
+        format!("{threads} threads \u{00b7} {}", kernel.label())
+    };
+    let mut cpu_threads = 0;
+    if let Some(kernel) = cpu_kernel {
+        // leave a core to the GPU's host thread so dispatches go out
+        // without waiting for a time slice
+        cpu_threads = config
+            .threads
+            .unwrap_or((cores - try_gpu as usize).clamp(1, cpu::MAX_THREADS));
+        miners.extend(cpu::spawn(
+            &session,
+            0..cpu_threads,
+            cpu_tag.clone(),
+            kernel,
+        ));
+        session.set_miner("cpu", cpu_label(cpu_threads, kernel));
+    }
+
+    let mut gpu_starting = None;
     if try_gpu {
         let gpu_config = gpu::GpuConfig {
             backend: config.backend,
@@ -75,51 +102,84 @@ pub fn run(config: Config) -> Result<Vec<Hit>, String> {
         };
         let (ready, started) = mpsc::channel();
         let gpu_session = session.clone();
-        let handle = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("gpu".into())
             .spawn(move || gpu::run(&gpu_session, &gpu_config, ready))
-            .map_err(|e| format!("could not start the GPU thread: {e}"))?;
-        let outcome = started
-            .recv()
-            .unwrap_or_else(|_| Err("the GPU thread exited before it started mining".into()));
-        match outcome {
-            Ok(description) => {
-                session.add_miner("gpu", description);
-                miners.push(handle);
-                gpu_running = true;
+        {
+            Ok(handle) => {
+                session.set_miner("gpu", "compiling the kernel\u{2026}".into());
+                gpu_starting = Some((handle, started));
             }
-            Err(e) if config.compute == Compute::Auto => {
-                eprintln!("warning: mining on the CPU only, the GPU is unavailable: {e}");
-            }
-            Err(e) => return Err(e),
+            Err(e) => session.fail(format!("could not start the GPU thread: {e}")),
         }
     }
 
-    if config.compute != Compute::Gpu {
-        let kernel = cpu::resolve_kernel(config.cpu_kernel)?;
-        let threads = config.threads.unwrap_or_else(|| {
-            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-            // leave a core to the GPU's host thread so dispatches go out
-            // without waiting for a time slice
-            (cores - gpu_running as usize).clamp(1, cpu::MAX_THREADS)
-        });
-        session.add_miner(
-            "cpu",
-            format!("{threads} threads \u{00b7} {}", kernel.label()),
-        );
-        miners.extend(cpu::spawn(&session, threads, cpu_tag, kernel));
-    }
+    let mut timed_out = false;
+    loop {
+        // the GPU reports in once its kernel has compiled and passed the
+        // self-test; until then the loop keeps the display and the stop
+        // conditions live, so an easy target the CPU finishes first does
+        // not wait on the compile
+        if let Some((handle, started)) = gpu_starting.take() {
+            let failure = match started.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {
+                    gpu_starting = Some((handle, started));
+                    None
+                }
+                Ok(Ok(description)) => {
+                    session.set_miner("gpu", description);
+                    miners.push(handle);
+                    None
+                }
+                Ok(Err(e)) => Some(e),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some("the GPU thread exited before mining".to_string())
+                }
+            };
+            match (failure, cpu_kernel) {
+                (None, _) => {}
+                (Some(e), Some(kernel)) if config.compute == Compute::Auto => {
+                    eprintln!("warning: mining on the CPU only, the GPU is unavailable: {e}");
+                    session.set_miner("gpu", format!("unavailable: {e}"));
+                    // the core held back for the GPU goes to the CPU miner
+                    if config.threads.is_none() && cpu_threads < cores.min(cpu::MAX_THREADS) {
+                        let extra = cpu_threads..cpu_threads + 1;
+                        miners.extend(cpu::spawn(&session, extra, cpu_tag.clone(), kernel));
+                        cpu_threads += 1;
+                        session.set_miner("cpu", cpu_label(cpu_threads, kernel));
+                    }
+                }
+                (Some(e), _) => session.fail(e),
+            }
+        }
 
-    while !session.stopped() {
+        if session.stopped() {
+            break;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            timed_out = true;
+            session.stop();
+            break;
+        }
         session.tick();
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
+    // a GPU thread still compiling is left behind: it sees the stop flag as
+    // soon as it is ready, and ends with the process otherwise
     for miner in miners {
         if miner.join().is_err() {
             session.fail("a mining thread panicked".into());
         }
     }
-    session.finish()
+    let hits = session.finish()?;
+    if timed_out && (hits.len() as u64) < config.count {
+        return Err(format!(
+            "time limit reached with {} of {} hits",
+            hits.len(),
+            config.count
+        ));
+    }
+    Ok(hits)
 }
 
 /// Print the address one salt deploys to.
