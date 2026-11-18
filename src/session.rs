@@ -5,6 +5,7 @@ use crate::keccak::{checksum, hex};
 use crate::pattern::Criteria;
 use crate::plan::{Guard, Plan, Scheme};
 use console::{style, Term};
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write as _;
@@ -45,8 +46,8 @@ struct State {
     /// lines of the panel currently on screen
     drawn: usize,
     last_report: Option<Instant>,
-    window_start: Instant,
-    window_tried: u64,
+    /// recent (time, tried) samples the displayed rate is measured over
+    samples: VecDeque<(Instant, u64)>,
     rate: f64,
 }
 
@@ -65,6 +66,7 @@ pub struct Session {
 
 const PANEL_INTERVAL: Duration = Duration::from_secs(1);
 const LINES_INTERVAL: Duration = Duration::from_secs(10);
+const RATE_WINDOW: Duration = Duration::from_secs(5);
 
 impl Session {
     pub fn new(
@@ -91,16 +93,20 @@ impl Session {
                 miners: Vec::new(),
                 drawn: 0,
                 last_report: None,
-                window_start: now,
-                window_tried: 0,
+                samples: VecDeque::from([(now, 0)]),
                 rate: 0.0,
             }),
         }
     }
 
-    /// Name a miner (`gpu`, `cpu`) in the status header once it is running.
-    pub fn add_miner(&self, label: &'static str, description: String) {
-        self.state.lock().unwrap().miners.push((label, description));
+    /// Describe a miner (`gpu`, `cpu`) in the status header, replacing any
+    /// earlier description under the same label.
+    pub fn set_miner(&self, label: &'static str, description: String) {
+        let mut state = self.state.lock().unwrap();
+        match state.miners.iter_mut().find(|(name, _)| *name == label) {
+            Some(miner) => miner.1 = description,
+            None => state.miners.push((label, description)),
+        }
     }
 
     /// Record `n` candidates tried.
@@ -114,6 +120,11 @@ impl Session {
 
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Stop the run without an error.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     /// Stop the run with an error (the first one wins).
@@ -227,13 +238,17 @@ impl Session {
         }
         let tried = self.tried();
 
-        // windowed rate, so it tracks current throughput (thermal throttling
-        // included) rather than the lifetime average
-        let window = now.duration_since(state.window_start).as_secs_f64();
-        if window >= 0.5 {
-            state.rate = (tried - state.window_tried) as f64 / window;
-            state.window_start = now;
-            state.window_tried = tried;
+        // rate over the last few seconds: recent enough to show thermal
+        // throttling, long enough to cover several GPU dispatches, which
+        // each land tens of millions of candidates at once
+        state.samples.push_back((now, tried));
+        while state.samples.len() > 2 && now.duration_since(state.samples[1].0) >= RATE_WINDOW {
+            state.samples.pop_front();
+        }
+        let (since, tried_then) = state.samples[0];
+        let window = now.duration_since(since).as_secs_f64();
+        if window >= 0.25 {
+            state.rate = (tried - tried_then) as f64 / window;
         }
         state.last_report = Some(now);
         let elapsed = now.duration_since(self.start).as_secs_f64();
