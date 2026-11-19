@@ -185,10 +185,12 @@ pub fn run(config: Config) -> Result<Vec<Hit>, String> {
 /// Print the address one salt deploys to.
 fn check(config: &Config, salt: [u8; 32]) -> Result<Hit, String> {
     let plan = &config.plan;
-    if !plan.accepts(&salt) {
+    // an unguarded factory derives the same way from any salt; CreateX
+    // branches on the salt's first 21 bytes
+    if plan.guard != plan::Guard::None && !plan.accepts(&salt) {
         return Err(format!(
-            "this salt does not start with the bytes this derivation fixes (0x{}); the factory \
-             would treat it differently, so its address is not computed here",
+            "this salt does not start with the bytes this derivation fixes (0x{}); CreateX \
+             would guard it differently, so its address is not computed here",
             keccak::hex(&plan.salt(&vec![0; plan.tag_len()], 0)[..32 - plan.mined_bytes()])
         ));
     }

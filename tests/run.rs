@@ -113,6 +113,23 @@ fn check_derives_the_address_of_a_given_salt() {
     ]);
     assert!(miss.unwrap_err().contains("does not meet the target"));
 
+    // an unguarded factory takes any salt (address from `cast create2`)
+    let hits = run(&[
+        "-s",
+        "create2",
+        "-f",
+        "0xdeadbeef00000000000000000000000000000000",
+        "-i",
+        "0xbc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a",
+        "--check",
+        "0x000000000000000000000000feed000000000000000000000000000000000000",
+    ])
+    .unwrap();
+    assert_eq!(
+        checksum(&hits[0].address),
+        "0xD04116cDd17beBE565EB2422F2497E06cC1C9833"
+    );
+
     // a salt CreateX would guard differently is refused, not mis-derived
     let foreign = "0xffffffffffffffffffffffffffffffffffffffff000102030405060708090a0b";
     let refused = run(&["-s", "create3", "-c", CALLER, "--check", foreign]);
