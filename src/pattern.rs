@@ -64,7 +64,7 @@ impl Pattern {
 
     fn set_nibble(&mut self, position: usize, nibble: u8) {
         let byte = position / 2;
-        if position % 2 == 0 {
+        if position.is_multiple_of(2) {
             self.mask[byte] |= 0xf0;
             self.value[byte] |= nibble << 4;
         } else {
