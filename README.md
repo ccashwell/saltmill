@@ -131,4 +131,4 @@ The expected addresses in the tests come from `cast`, and the CreateX ones were 
 
 ## License
 
-MIT. The keccak kernels derive from create2crunch by 0age.
+MIT. The keccak kernels derive from [create2crunch by 0age](https://github.com/0age/create2crunch).
