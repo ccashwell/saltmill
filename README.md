@@ -5,9 +5,11 @@ A salt miner for vanity contract addresses, for both CREATE2 and CREATE3, that u
 It brings together two earlier tools: the Apple silicon work on [create2crunch](https://github.com/0age/create2crunch) (CREATE2 only) and a CPU-only CREATE3 miner for [CreateX](https://github.com/pcaversaccio/createx) deployments.
 
 ```sh
-cargo build --release
-./target/release/saltmill --help
+cargo install saltmill
+saltmill --help
 ```
+
+That needs Rust 1.89 or later. To build from a checkout instead, run `cargo build --release` and use `./target/release/saltmill`.
 
 ## Mining
 

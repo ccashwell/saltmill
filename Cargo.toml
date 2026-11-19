@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
-description = "Vanity salt miner for CREATE2 and CREATE3 (CreateX) addresses on CPU, GPU and hybrid Apple silicon"
+description = "Vanity address salt miner for CREATE2 and CREATE3 (CreateX) on the GPU and every CPU core, built for Apple silicon"
+repository = "https://github.com/ccashwell/saltmill"
+readme = "README.md"
+keywords = ["create2", "create3", "createx", "vanity-address", "ethereum"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
