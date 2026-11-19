@@ -14,8 +14,22 @@ keccak-asm = "0.1"
 ocl = { version = "0.19", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
-objc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError", "NSArray"] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLComputePipeline",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLAllocation",
+    "MTLTypes",
+] }
 
 [features]
 # OpenCL GPU backend for non-Apple GPUs (needs an OpenCL ICD loader at link time)
