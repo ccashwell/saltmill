@@ -378,6 +378,7 @@ mod tests {
         assert_eq!(target_words(&Criteria::default()), [0; 11]);
     }
 
+    #[cfg(any(target_os = "macos", feature = "opencl"))]
     /// Every candidate of a batch, checked on the host: the device must
     /// report exactly the candidates the reference derivation accepts.
     fn check_batch(
@@ -408,6 +409,7 @@ mod tests {
         assert_eq!(found.count as usize, expected.len());
     }
 
+    #[cfg(any(target_os = "macos", feature = "opencl"))]
     fn check_device(device: &dyn Device) {
         let prefix = Criteria {
             pattern: Pattern::from_prefix(&[0xc, 0x0, 0xd]),
